@@ -1,25 +1,45 @@
 {
   "oracle": {
-    "hand_err_px": 60.5,
-    "hand_recall": 0.25,
-    "n_hands": 24
+    "hp_err_px": 44.2,
+    "hp_recall": 1.0,
+    "n_hands": 24,
+    "mp_err_px": 60.5,
+    "mp_recall": 0.25,
+    "bg_flow_px": 0.0
   },
   "context_copy": {
-    "hand_err_px": null,
-    "hand_recall": 0.0,
+    "hp_err_px": 49.9,
+    "hp_recall": 1.0,
     "n_hands": 24,
+    "mp_err_px": null,
+    "mp_recall": 0.0,
+    "bg_flow_px": 0.0,
     "psnr": 26.6
   },
   "model": {
-    "hand_err_px": null,
-    "hand_recall": 0.0,
+    "hp_err_px": 315.5,
+    "hp_recall": 1.0,
     "n_hands": 24,
+    "mp_err_px": null,
+    "mp_recall": 0.0,
+    "bg_flow_px": 0.58,
     "psnr": 15.49
   },
   "swapped": {
-    "hand_err_px": null,
-    "hand_recall": 0.0,
-    "n_hands": 24
+    "hp_err_px": 226.7,
+    "hp_recall": 0.958,
+    "n_hands": 24,
+    "mp_err_px": null,
+    "mp_recall": 0.0,
+    "bg_flow_px": 0.63
+  },
+  "static_head": {
+    "hp_err_px": 211.4,
+    "hp_recall": 0.958,
+    "n_hands": 24,
+    "mp_err_px": null,
+    "mp_recall": 0.0,
+    "bg_flow_px": 0.47
   },
   "_info": {
     "ckpt": "runs/smoke/last.pt",

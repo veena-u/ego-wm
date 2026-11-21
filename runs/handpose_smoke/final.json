@@ -1,0 +1,20 @@
+{
+  "ours": {
+    "val_unseen": {
+      "recall": 0.971,
+      "err_px": 37.3,
+      "err_px_all": 37.0,
+      "pck20": 0.212,
+      "hands": 582,
+      "erased_present": 0.019
+    },
+    "val_seen": {
+      "recall": 0.991,
+      "err_px": 29.9,
+      "err_px_all": 29.5,
+      "pck20": 0.304,
+      "hands": 566,
+      "erased_present": 0.0
+    }
+  }
+}

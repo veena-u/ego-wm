@@ -1,17 +1,24 @@
 """Roll out the world model on held-out clips and measure whether it obeys the hands.
 
 For each clip: start from the first real frame, generate the rest from the clip's actions,
-decode, and score:
-  hand_err_px     MediaPipe joints on generated frames vs the commanded (projected) joints,
-                  px at 1080p, median over detected hands
-  hand_recall     fraction of commanded visible hands that MediaPipe finds in generated frames
+decode, and score. Hand metrics use the EgoDex-trained estimator (--handpose; primary) and/or
+MediaPipe (--mediapipe; optional, weaker on egocentric hands):
+  <inst>_err_px   estimated joints on generated frames vs the commanded joints, px at 1080p,
+                  median over found hands of the mean joint error
+  <inst>_recall   fraction of commanded visible hands (>=15 valid joints) that are found
   psnr            vs the real frames (only meaningful for the true-action rollout)
-  swapped_*       same start frame, actions taken from a DIFFERENT clip: does the hand follow?
-Reference rows (no model needed):
-  oracle          real frames through the VAE: the best achievable hand_err / recall
+  bg_flow_px      median optical flow outside the hands between consecutive frames (px @ output
+                  res): how much the camera/background moves
+Rows:
+  oracle          real frames through the VAE: the best achievable scores (the floor)
   context_copy    every frame = the first frame: what ignoring the actions scores
+  model           rollout with the clip's own actions
+  swapped         same start frame, ANOTHER clip's actions: do the hands follow the new motion?
+  static_head     clip's hand actions but head motion = none: is the camera steady (bg_flow_px
+                  well below the real clip's) while the hands still follow (err/recall)?
 
-python scripts/evaluate.py --ckpt runs/v1/last.pt --data /data/latents --clips 32 --out runs/v1/eval
+python scripts/evaluate.py --ckpt runs/v1/last.pt --data /data/latents --handpose runs/handpose/handpose.pt \
+    --clips 32 --out runs/v1/eval
 """
 import argparse
 import json
@@ -62,14 +69,13 @@ def decode(vae, z, mean, std):
     return from_video_tensor(vae.decode(z.to(params[0].dtype) if params else z).sample)
 
 
-def hand_metrics(det, frames, uv, valid, size_wh):
-    """frames: (T,H,W,3) generated at size_wh; uv/valid: commanded joints (T,2,21,2)/(T,2,21) at 1080p."""
+def mediapipe_metrics(det, frames, uv, valid, size_wh):
+    """frames: (T,H,W,3) at size_wh; uv/valid: commanded joints (T,2,21,2)/(T,2,21) at 1080p."""
     sx, sy = size_wh[0] / 1920, size_wh[1] / 1080
     errs, found, total = [], 0, 0
     for t in range(1, len(frames)):  # frame 0 is the given context
         target = uv[t] * [sx, sy]
-        dets = det(frames[t])
-        m = match_to_hands(dets, target, valid[t], max_dist=120 * sx / 0.44)
+        m = match_to_hands(det(frames[t]), target, valid[t], max_dist=120 * sx / 0.44)
         for h in range(2):
             if valid[t, h].sum() < 15:
                 continue
@@ -80,9 +86,46 @@ def hand_metrics(det, frames, uv, valid, size_wh):
     return errs, found, total
 
 
-def summarize(errs, found, total):
-    return {"hand_err_px": round(float(np.median(errs)), 1) if errs else None,
-            "hand_recall": round(found / max(total, 1), 3), "n_hands": total}
+def handpose_metrics(est, frames, uv, valid):
+    """Same rules with the EgoDex-trained estimator (it knows left from right, so no matching)."""
+    puv, _, prob = est(frames[1:])
+    errs, found, total = [], 0, 0
+    for t in range(len(puv)):
+        for h in range(2):
+            v = valid[t + 1, h]
+            if v.sum() < 15:
+                continue
+            total += 1
+            if prob[t, h] > 0.5:
+                found += 1
+                errs.append(np.linalg.norm(puv[t, h] - uv[t + 1, h], axis=-1)[v].mean())
+    return errs, found, total
+
+
+def background_flow(frames, uv, valid, size_wh, margin=40):
+    """Median optical-flow magnitude outside dilated hand boxes, over consecutive frames."""
+    sx, sy = size_wh[0] / 1920, size_wh[1] / 1080
+    gray = [cv2.cvtColor(np.ascontiguousarray(f), cv2.COLOR_RGB2GRAY) for f in frames]
+    mags = []
+    for t in range(len(frames) - 1):
+        flow = cv2.calcOpticalFlowFarneback(gray[t], gray[t + 1], None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        mask = np.ones(gray[t].shape, bool)
+        for tt in (t, t + 1):
+            for h in range(2):
+                if valid[tt, h].sum() < 3:
+                    continue
+                p = uv[tt, h][valid[tt, h]] * [sx, sy]
+                x0, y0 = np.maximum(p.min(0) - margin, 0).astype(int)
+                x1, y1 = (p.max(0) + margin).astype(int)
+                mask[y0:y1, x0:x1] = False
+        if mask.mean() > 0.2:
+            mags.append(np.median(np.linalg.norm(flow[mask], axis=-1)))
+    return float(np.median(mags)) if mags else None
+
+
+def summarize(prefix, errs, found, total):
+    return {f"{prefix}_err_px": round(float(np.median(errs)), 1) if errs else None,
+            f"{prefix}_recall": round(found / max(total, 1), 3), "n_hands": total}
 
 
 def psnr(a, b):
@@ -101,6 +144,8 @@ def main():
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--max-latent-frames", type=int, default=None)
     ap.add_argument("--videos", type=int, default=6, help="side-by-side mp4s to write")
+    ap.add_argument("--handpose", default=None, help="EgoDex hand pose estimator checkpoint (primary metric)")
+    ap.add_argument("--mediapipe", action="store_true", help="also score with MediaPipe")
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
@@ -130,16 +175,33 @@ def main():
     size_wh = tuple(meta["size_wh"])
     vae = load_vae(meta["vae"], device, dtype=torch.float32, tiling=device.type != "cuda")
     mean, std = latent_norm(vae)
-    det = HandDetector()
+    instruments = {}
+    if a.handpose:
+        from egodex.handpose import Estimator
+        est = Estimator(a.handpose, device)
+        instruments["hp"] = lambda fr, uv, va: handpose_metrics(est, fr, uv, va)
+    if a.mediapipe or not a.handpose:
+        det = HandDetector()
+        instruments["mp"] = lambda fr, uv, va: mediapipe_metrics(det, fr, uv, va, size_wh)
+    # Normalized head action for "no head motion": identity rotation (6D = [1,0,0,0,1,0]) and zero
+    # translation, mapped through the same normalization as training - NOT all-zeros.
+    a_mean, a_std = ds.a_mean[:9], ds.a_std[:9]
+    still = (np.array([1, 0, 0, 0, 1, 0, 0, 0, 0], np.float32) - a_mean) / a_std
 
-    rows = {k: {"errs": [], "found": 0, "total": 0, "psnr": []} for k in
-            ("oracle", "context_copy", "model", "swapped")}
+    keys = ("oracle", "context_copy", "model", "swapped", "static_head")
+    rows = {k: {"psnr": [], "bg": [], **{i: {"errs": [], "found": 0, "total": 0} for i in instruments}}
+            for k in keys}
 
     def add(key, frames, uv, valid, real=None):
-        e, f, t = hand_metrics(det, frames, uv, valid, size_wh)
-        rows[key]["errs"] += e
-        rows[key]["found"] += f
-        rows[key]["total"] += t
+        for name, fn in instruments.items():
+            e, f, t = fn(frames, uv, valid)
+            r = rows[key][name]
+            r["errs"] += e
+            r["found"] += f
+            r["total"] += t
+        bg = background_flow(frames, uv, valid, size_wh)
+        if bg is not None:
+            rows[key]["bg"].append(bg)
         if real is not None:
             rows[key]["psnr"].append(np.mean([psnr(x, y) for x, y in zip(frames[1:], real[1:])]))
 
@@ -176,6 +238,16 @@ def main():
         fake2 = decode(vae, gen2, mean, std)[: len(vid_idx)]
         add("swapped", fake2, uv2, valid2)
 
+        # Static head: same hands, no head motion. Head dims are per frame, repeated per VAE group.
+        sp, ac, tx = cond(b)
+        fpl = groups.shape[1]
+        ac = ac.view(1, Fl, fpl, -1).clone()
+        ac[..., :9] = torch.from_numpy(still).to(ac)
+        gen3 = generate(model, lat.to(dt), sp, ac.view(1, Fl, -1), tx, steps=a.steps,
+                        shift=margs.get("shift", 3.0), generator=g)
+        fake3 = decode(vae, gen3, mean, std)[: len(vid_idx)]
+        add("static_head", fake3, uv, valid)
+
         if n < a.videos:
             W, H = size_wh
             vw = cv2.VideoWriter(str(out / f"clip{n:02d}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (3 * W, H))
@@ -190,12 +262,15 @@ def main():
             vw.release()
         print(f"clip {n + 1}/{len(pick)}", flush=True)
 
-    det.close()
     res = {}
     for k, r in rows.items():
-        if r["total"] == 0 and not r["psnr"]:
+        if not r["bg"] and not r["psnr"]:
             continue
-        res[k] = summarize(r["errs"], r["found"], r["total"])
+        res[k] = {}
+        for name in instruments:
+            res[k].update(summarize(name, r[name]["errs"], r[name]["found"], r[name]["total"]))
+        if r["bg"]:
+            res[k]["bg_flow_px"] = round(float(np.median(r["bg"])), 2)
         if r["psnr"]:
             res[k]["psnr"] = round(float(np.mean(r["psnr"])), 2)
     res["_info"] = {"ckpt": a.ckpt, "clips": len(pick), "splits": a.splits, "steps": a.steps}
