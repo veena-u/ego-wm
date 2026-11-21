@@ -1,0 +1,42 @@
+{
+  "episodes": 3243,
+  "kept": 3116,
+  "hours_total": 7.62,
+  "hours_kept": 7.27,
+  "drop_reasons": {
+    "tracking_spikes": 35,
+    "no_clean_clip": 18,
+    "too_short": 18,
+    "hands_out_of_view": 18,
+    "low_confidence": 66
+  },
+  "kept_per_split": {
+    "val_unseen": 164,
+    "train": 2791,
+    "val_seen": 161
+  },
+  "hours_kept_per_split": {
+    "train": 6.28,
+    "val_seen": 0.37,
+    "val_unseen": 0.61
+  },
+  "unseen_tasks": [
+    "add_remove_lid",
+    "insert_remove_utensils",
+    "play_piano",
+    "point_and_click_remote",
+    "put_away_set_up_board_game",
+    "put_in_take_out_glasses",
+    "set_up_clean_up_chessboard",
+    "sleeve_unsleeve_cards",
+    "sort_beads",
+    "type_keyboard"
+  ],
+  "kept_with_clean_33_frame_clip_at_15fps": 2737,
+  "tasks": {
+    "train": 101,
+    "val_seen": 69,
+    "val_unseen": 10
+  },
+  "action_stat_frames": 86559
+}

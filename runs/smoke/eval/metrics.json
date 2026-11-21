@@ -1,0 +1,34 @@
+{
+  "oracle": {
+    "hand_err_px": 60.5,
+    "hand_recall": 0.25,
+    "n_hands": 24
+  },
+  "context_copy": {
+    "hand_err_px": null,
+    "hand_recall": 0.0,
+    "n_hands": 24,
+    "psnr": 26.6
+  },
+  "model": {
+    "hand_err_px": null,
+    "hand_recall": 0.0,
+    "n_hands": 24,
+    "psnr": 15.49
+  },
+  "swapped": {
+    "hand_err_px": null,
+    "hand_recall": 0.0,
+    "n_hands": 24
+  },
+  "_info": {
+    "ckpt": "runs/smoke/last.pt",
+    "clips": 2,
+    "splits": [
+      "train",
+      "val_seen",
+      "val_unseen"
+    ],
+    "steps": 3
+  }
+}
