@@ -1,0 +1,19 @@
+# Python / OS
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Training outputs (checkpoints are GBs; logs live in W&B)
+runs/
+
+# Data derived from EgoDex (frames, latents, embeddings): regenerate with the scripts, don't publish
+data/handpose_smoke/
+data/handpose_frames/
+data/latents*/
+data/vae_compare*/
+data/text_emb*.pt
+*.pt
+*.mp4
+data/index.csv
+data/summary.json
