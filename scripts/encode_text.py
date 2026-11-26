@@ -23,7 +23,7 @@ def clean(t: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--index", default="data/index.csv")
+    ap.add_argument("--index", nargs="+", default=["data/index.csv"], help="one or more index.csv files")
     ap.add_argument("--out", required=True)
     ap.add_argument("--repo", default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
     ap.add_argument("--batch-size", type=int, default=64)
@@ -35,8 +35,11 @@ def main():
 
     from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 
-    with open(a.index) as f:
-        texts = sorted({r["description"] for r in csv.DictReader(f) if r["description"]})[: a.limit]
+    texts = set()
+    for path in a.index:
+        with open(path) as f:
+            texts |= {r["description"] for r in csv.DictReader(f) if r["description"]}
+    texts = sorted(texts)[: a.limit]
     print(f"{len(texts)} unique descriptions")
     tok = AutoTokenizer.from_pretrained(a.repo, subfolder="tokenizer")
     if a.tiny_random:

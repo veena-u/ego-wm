@@ -18,6 +18,8 @@ Heatmaps are NOT stored (~20x larger than latents); the dataset rebuilds them fr
 python scripts/preprocess.py --vae wan2.1 --out /data/egodex_latents --shard 1/4
 """
 import argparse
+import json
+import zlib
 import sys
 import time
 import traceback
@@ -63,10 +65,16 @@ def main():
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--shard", default="1/1", help="i/n: process every n-th episode starting at i")
     ap.add_argument("--limit", type=int, default=None, help="max episodes (for testing)")
+    ap.add_argument("--max-clips", type=int, default=2,
+                    help="max clips per episode, picked at random (seeded by episode path) across the "
+                         "episode; 0 = all. Clips of one recording look alike, so for the full dataset "
+                         "more recordings beat more clips per recording. Runs v1/v2 used all (0).")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--dtype", default="fp32", choices=["bf16", "fp32"])
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"],
+                    help="bf16 measured equal to fp32: latents differ 1.4%%, recon PSNR identical")
     a = ap.parse_args()
 
+    torch.backends.cudnn.benchmark = True  # fixed clip shape: let cuDNN pick the fastest conv3d
     i, n = map(int, a.shard.split("/"))
     rows = load_index(a.index)[i - 1::n][: a.limit]
     out = Path(a.out)
@@ -79,12 +87,17 @@ def main():
     for r in rows:
         ep_path = Path(r["path"])  # <part>/<task>/<n>: the part is needed, ids repeat across parts
         dst = out / f"{ep_path.parent.parent.name}__{ep_path.parent.name}__{ep_path.name}.pt"
-        if dst.exists():
+        # Done = the .pt exists, or its sidecar does (the sidecar is written only after the .pt is
+        # complete, and stays behind when an uploader moves the .pt to cloud storage).
+        if dst.exists() or dst.with_suffix(".json").exists():
             continue
         try:
             starts = clip_starts(r["n_frames"], r["spike_frames"], a.clip_frames, a.stride)
             if not starts:
                 continue
+            if a.max_clips and len(starts) > a.max_clips:
+                rng = np.random.default_rng(zlib.crc32(r["path"].encode()))
+                starts = sorted(int(x) for x in rng.choice(starts, a.max_clips, replace=False))
             ep = Episode(r["path"])
             keys = ("uv", "z", "valid", "elbow_uv", "elbow_ok", "actions")
             rec = {k: [] for k in ("latents",) + keys}
@@ -104,6 +117,11 @@ def main():
             tmp = dst.with_suffix(".tmp")
             torch.save(item, tmp)
             tmp.rename(dst)  # atomic: a crash never leaves a half-written file that looks done
+            # Sidecar with what the dataset manifest needs, so it never has to open the big file.
+            # Written after the .pt is complete, so it also marks the episode as done (see above).
+            side = dst.with_suffix(".jtmp")
+            side.write_text(json.dumps({"n": len(starts), "split": r["split"], "task": r["task"]}))
+            side.rename(dst.with_suffix(".json"))
             done += 1
             clips_total += len(starts)
         except Exception:  # noqa: BLE001

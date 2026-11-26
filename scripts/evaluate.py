@@ -103,12 +103,13 @@ def handpose_metrics(est, frames, uv, valid):
 
 
 def background_flow(frames, uv, valid, size_wh, margin=40):
-    """Median optical-flow magnitude outside dilated hand boxes, over consecutive frames."""
+    """Camera motion: median displacement of textured background points (Shi-Tomasi corners outside
+    dilated hand boxes, tracked with Lucas-Kanade) between consecutive frames. Dense flow is NOT used:
+    walls and tables are textureless, their flow is ~0, and a median over all pixels always read 0."""
     sx, sy = size_wh[0] / 1920, size_wh[1] / 1080
     gray = [cv2.cvtColor(np.ascontiguousarray(f), cv2.COLOR_RGB2GRAY) for f in frames]
     mags = []
     for t in range(len(frames) - 1):
-        flow = cv2.calcOpticalFlowFarneback(gray[t], gray[t + 1], None, 0.5, 3, 15, 3, 5, 1.2, 0)
         mask = np.ones(gray[t].shape, bool)
         for tt in (t, t + 1):
             for h in range(2):
@@ -118,8 +119,15 @@ def background_flow(frames, uv, valid, size_wh, margin=40):
                 x0, y0 = np.maximum(p.min(0) - margin, 0).astype(int)
                 x1, y1 = (p.max(0) + margin).astype(int)
                 mask[y0:y1, x0:x1] = False
-        if mask.mean() > 0.2:
-            mags.append(np.median(np.linalg.norm(flow[mask], axis=-1)))
+        if mask.mean() < 0.2:
+            continue
+        pts = cv2.goodFeaturesToTrack(gray[t], 300, 0.01, 8, mask=mask.astype(np.uint8) * 255)
+        if pts is None or len(pts) < 10:
+            continue
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(gray[t], gray[t + 1], pts, None, winSize=(21, 21), maxLevel=3)
+        ok = st[:, 0] == 1
+        if ok.sum() >= 10:
+            mags.append(float(np.median(np.linalg.norm((nxt - pts)[ok, 0], axis=-1))))
     return float(np.median(mags)) if mags else None
 
 
@@ -133,6 +141,7 @@ def psnr(a, b):
     return 10 * np.log10(255 ** 2 / max(mse, 1e-10))
 
 
+@torch.no_grad()  # without this the VAE decode keeps its autograd graph (~75 GB for one clip)
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=None, help="omit to compute only the reference rows")
@@ -146,13 +155,34 @@ def main():
     ap.add_argument("--videos", type=int, default=6, help="side-by-side mp4s to write")
     ap.add_argument("--handpose", default=None, help="EgoDex hand pose estimator checkpoint (primary metric)")
     ap.add_argument("--mediapipe", action="store_true", help="also score with MediaPipe")
+    ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cfg", type=float, default=1.0, help="classifier-free guidance on the hand conditioning")
+    ap.add_argument("--full-recompute", action="store_true", help="old non-cached sampler (for comparison)")
+    ap.add_argument("--shard", default="1/1", help="i/n: score every n-th clip (one process per GPU); "
+                    "then run once with --merge n to combine. scripts/eval_parallel.sh does both")
+    ap.add_argument("--merge", type=int, default=None, help="combine n shard files in --out into metrics.json")
     a = ap.parse_args()
     device = torch.device(a.device)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+
+    si, ns = map(int, a.shard.split("/"))
+    if a.merge:
+        shards = [json.loads((out / f"shard{i}of{a.merge}.json").read_text()) for i in range(1, a.merge + 1)]
+        rows, instruments = shards[0]["rows"], shards[0]["instruments"]
+        for sh in shards[1:]:
+            for k, r in sh["rows"].items():
+                rows[k]["psnr"] += r["psnr"]
+                rows[k]["bg"] += r["bg"]
+                for name in instruments:
+                    for f in ("errs", "found", "total"):
+                        rows[k][name][f] += r[name][f]
+        a.ckpt, a.cfg, a.steps = shards[0]["ckpt"], shards[0]["cfg"], shards[0]["steps"]
+        n_clips = sum(sh["n"] for sh in shards)
+        return finish(a, out, rows, instruments, n_clips)
 
     model, margs = None, {}
     if a.ckpt:
@@ -173,7 +203,10 @@ def main():
     pick = rng.permutation(len(ds))[: a.clips]
     meta = ds._load(ds.items[pick[0]][0])["meta"]
     size_wh = tuple(meta["size_wh"])
-    vae = load_vae(meta["vae"], device, dtype=torch.float32, tiling=device.type != "cuda")
+    # bf16 on GPU: same reconstruction quality as fp32 (measured for preprocessing) at half the
+    # memory; a full fp32 untiled decode of one clip needs ~75 GB.
+    vae = load_vae(meta["vae"], device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+                   tiling=device.type != "cuda")
     mean, std = latent_norm(vae)
     instruments = {}
     if a.handpose:
@@ -187,6 +220,23 @@ def main():
     # translation, mapped through the same normalization as training - NOT all-zeros.
     a_mean, a_std = ds.a_mean[:9], ds.a_std[:9]
     still = (np.array([1, 0, 0, 0, 1, 0, 0, 0, 0], np.float32) - a_mean) / a_std
+
+    student = ck.get("student") if a.ckpt else None
+    if student:  # distilled few-step student (scripts/distill.py): guidance is baked in
+        from egodex.stream import stream_generate
+        print(f"student checkpoint: {student['steps']} steps, guidance {student['cfg']} baked in", flush=True)
+
+        def sample(*x, **k):
+            return stream_generate(*x, **k, student_sigmas=student["sigmas"])
+    elif model is not None and model.causal and not a.full_recompute:
+        # KV-cached streaming: exact up to float rounding (scripts/test_stream.py), ~6x faster
+        from egodex.stream import stream_generate
+
+        def sample(*x, **k):
+            return stream_generate(*x, **k, cfg=a.cfg)
+    else:
+        assert a.cfg == 1.0, "--cfg needs the streaming sampler (causal model)"
+        sample = generate
 
     keys = ("oracle", "context_copy", "model", "swapped", "static_head")
     rows = {k: {"psnr": [], "bg": [], **{i: {"errs": [], "found": 0, "total": 0} for i in instruments}}
@@ -205,7 +255,11 @@ def main():
         if real is not None:
             rows[key]["psnr"].append(np.mean([psnr(x, y) for x, y in zip(frames[1:], real[1:])]))
 
+    n_done = 0
     for n, idx in enumerate(pick):
+        if n % ns != si - 1:  # global n: same seeds, swap partners and video names as a 1-process run
+            continue
+        n_done += 1
         b = ds[int(idx)]
         fi, ci = ds.items[int(idx)]
         raw = ds._load(fi)
@@ -223,7 +277,7 @@ def main():
         cond = lambda bb: (bb["spatial"][None].to(device, dt), bb["actions"][None].to(device, dt),  # noqa: E731
                            bb["text"][None].to(device, dt))
         g = torch.Generator(device=device).manual_seed(a.seed + n)
-        gen = generate(model, lat.to(dt), *cond(b), steps=a.steps, shift=margs.get("shift", 3.0), generator=g)
+        gen = sample(model, lat.to(dt), *cond(b), steps=a.steps, shift=margs.get("shift", 3.0), generator=g)
         fake = decode(vae, gen, mean, std)[: len(vid_idx)]
         add("model", fake, uv, valid, real)
 
@@ -234,7 +288,7 @@ def main():
         fi2, ci2 = ds.items[other]
         raw2 = ds._load(fi2)
         uv2, valid2 = raw2["uv"][ci2].numpy()[vid_idx], raw2["valid"][ci2].numpy()[vid_idx]
-        gen2 = generate(model, lat.to(dt), *cond(b2), steps=a.steps, shift=margs.get("shift", 3.0), generator=g)
+        gen2 = sample(model, lat.to(dt), *cond(b2), steps=a.steps, shift=margs.get("shift", 3.0), generator=g)
         fake2 = decode(vae, gen2, mean, std)[: len(vid_idx)]
         add("swapped", fake2, uv2, valid2)
 
@@ -243,7 +297,7 @@ def main():
         fpl = groups.shape[1]
         ac = ac.view(1, Fl, fpl, -1).clone()
         ac[..., :9] = torch.from_numpy(still).to(ac)
-        gen3 = generate(model, lat.to(dt), sp, ac.view(1, Fl, -1), tx, steps=a.steps,
+        gen3 = sample(model, lat.to(dt), sp, ac.view(1, Fl, -1), tx, steps=a.steps,
                         shift=margs.get("shift", 3.0), generator=g)
         fake3 = decode(vae, gen3, mean, std)[: len(vid_idx)]
         add("static_head", fake3, uv, valid)
@@ -262,6 +316,20 @@ def main():
             vw.release()
         print(f"clip {n + 1}/{len(pick)}", flush=True)
 
+    if ns > 1:
+        clean = lambda x: [float(v) for v in x]  # noqa: E731
+        dump = {k: {"psnr": clean(r["psnr"]), "bg": clean(r["bg"]),
+                    **{i: {"errs": clean(r[i]["errs"]), "found": int(r[i]["found"]), "total": int(r[i]["total"])}
+                       for i in instruments}} for k, r in rows.items()}
+        (out / f"shard{si}of{ns}.json").write_text(json.dumps(
+            {"rows": dump, "instruments": list(instruments), "n": n_done, "ckpt": a.ckpt, "cfg": a.cfg,
+             "steps": a.steps}))
+        print(f"shard {si}/{ns}: {n_done} clips", flush=True)
+        return
+    return finish(a, out, rows, list(instruments), len(pick))
+
+
+def finish(a, out, rows, instruments, n_clips):
     res = {}
     for k, r in rows.items():
         if not r["bg"] and not r["psnr"]:
@@ -273,8 +341,16 @@ def main():
             res[k]["bg_flow_px"] = round(float(np.median(r["bg"])), 2)
         if r["psnr"]:
             res[k]["psnr"] = round(float(np.mean(r["psnr"])), 2)
-    res["_info"] = {"ckpt": a.ckpt, "clips": len(pick), "splits": a.splits, "steps": a.steps}
+    res["_info"] = {"ckpt": a.ckpt, "clips": n_clips, "splits": a.splits, "steps": a.steps, "cfg": a.cfg}
     (out / "metrics.json").write_text(json.dumps(res, indent=2))
+    if a.wandb_project:
+        from egodex import wb
+        import wandb
+        run = wb.init(a.wandb_project, out, vars(a), "eval")
+        run.summary.update({f"{row}/{k}": v for row, m in res.items() if not row.startswith("_") for k, v in m.items()})
+        for vid in sorted(out.glob("clip*.mp4")):
+            run.log({f"videos/{vid.stem}": wandb.Video(str(vid), format="mp4")})
+        run.finish()
     print(json.dumps(res, indent=2))
 
 

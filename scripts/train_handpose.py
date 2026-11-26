@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from egodex.handpose import HandPoseNet, decode, target_heatmaps  # noqa: E402
+from egodex import wb  # noqa: E402
 
 FAIR = list(range(2, 21))
 
@@ -229,6 +230,7 @@ def main():
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--wandb-project", default=None)
     a = ap.parse_args()
     device = torch.device(a.device)
     amp = device.type == "cuda"
@@ -255,6 +257,7 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1, (s + 1) / 300) * 0.5 * (1 + math.cos(math.pi * min(s / steps, 1))))
     log = open(out / "log.jsonl", "a")
+    run = wb.init(a.wandb_project, out, vars(a), "handpose")
     step, t0 = 0, time.time()
     net.train()
     while step < steps:
@@ -272,6 +275,7 @@ def main():
                 rec = {"step": step, "loss_heat": lh, "loss_present": lp, "img_per_s": 50 * a.batch_size / (time.time() - t0)}
                 print(json.dumps(rec), flush=True)
                 log.write(json.dumps(rec) + "\n")
+                wb.log(run, rec, step)
                 t0 = time.time()
             if step % a.val_every == 0 or step == steps:
                 rec = {"step": step, **{s: {**evaluate(net, l, device, amp),
@@ -280,6 +284,7 @@ def main():
                 print(json.dumps(rec), flush=True)
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
+                wb.log(run, rec, step)
                 torch.save({"model": net.state_dict(), "backbone": a.backbone, "in_wh": in_wh, "step": step},
                            out / "handpose.pt")
             if step >= steps:
@@ -290,6 +295,10 @@ def main():
     if a.mediapipe_frames:
         final["mediapipe"] = {s: mediapipe_scores(l.dataset, a.mediapipe_frames) for s, l in vloaders.items()}
     (out / "final.json").write_text(json.dumps(final, indent=2))
+    if run is not None:
+        for who, d in final.items():
+            run.summary.update({f"final/{who}/{s}/{k}": v for s, m in d.items() for k, v in m.items()})
+        run.finish()
     print(json.dumps(final, indent=2))
 
 

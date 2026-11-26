@@ -59,14 +59,23 @@ class LatentClips(Dataset):
 
     def _manifest(self, splits):
         mpath = self.root / "manifest.json"
-        files = sorted(p.name for p in self.root.glob("*.pt"))
+        files = sorted(p.name for p in self.root.glob("*.pt") if not p.name.startswith("."))  # skip macOS ._ files
         man = json.loads(mpath.read_text()) if mpath.exists() else {}
         changed = False
-        for f in files:
-            if f not in man:
+        missing = [f for f in files if f not in man]
+        if missing:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def info(f):
+                side = (self.root / f).with_suffix(".json")  # written by preprocess.py
+                if side.exists():
+                    return f, json.loads(side.read_text())
                 d = torch.load(self.root / f, weights_only=False, map_location="cpu")
-                man[f] = {"n": int(d["latents"].shape[0]), "split": d["split"], "task": d["task"]}
-                changed = True
+                return f, {"n": int(d["latents"].shape[0]), "split": d["split"], "task": d["task"]}
+
+            with ThreadPoolExecutor(32) as ex:
+                man.update(dict(ex.map(info, missing)))
+            changed = True
         if changed:
             mpath.write_text(json.dumps(man))
         keep = [f for f in files if man[f]["split"] in splits]

@@ -24,15 +24,27 @@ from diffusers.models.transformers.transformer_wan import WanAttnProcessor, WanT
 
 
 class _MaskedSelfAttn(WanAttnProcessor):
-    """Wan attention processor that applies `self.mask` to self-attention only."""
+    """Wan attention processor that applies the block-causal mask to self-attention only.
+
+    The mask is derived from the sequence length at call time (tokens per frame is fixed for a
+    model run), never stored from the last forward: gradient checkpointing re-runs blocks during
+    backward, possibly after other forwards of different lengths (distillation does several per
+    backward), and a stored mask would then be the wrong one."""
 
     def __init__(self):
         super().__init__()
-        self.mask = None
+        self.causal, self.tpf = False, None
+        self._masks = {}
+
+    def mask_for(self, n_tokens, device):
+        key = (n_tokens, self.tpf, str(device))
+        if key not in self._masks:
+            self._masks[key] = block_causal_mask(n_tokens // self.tpf, self.tpf, device)
+        return self._masks[key]
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, rotary_emb=None):
-        if encoder_hidden_states is None and attention_mask is None:
-            attention_mask = self.mask
+        if encoder_hidden_states is None and attention_mask is None and self.causal:
+            attention_mask = self.mask_for(hidden_states.shape[1], hidden_states.device)
         return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, rotary_emb)
 
 
@@ -72,16 +84,23 @@ class ActionWorldModel(nn.Module):
     def new_parameters(self):
         return list(self.spatial_embed.parameters()) + list(self.action_mlp.parameters())
 
-    def forward(self, x, sigma, spatial, actions, text):
+    def forward(self, x, sigma, spatial, actions, text, frame_offset: int = 0):
         """x: (B,C,F,h,w) noisy latents; sigma: (B,F) in [0,1]; spatial: (B,S*fpl,F,h,w);
-        actions: (B,F,A*fpl) normalized; text: (B,L,text_dim). Returns predicted v (B,C,F,h,w)."""
+        actions: (B,F,A*fpl) normalized; text: (B,L,text_dim). Returns predicted v (B,C,F,h,w).
+        frame_offset: temporal position of x's first frame (streaming with a KV cache feeds one
+        frame at a time; its rotary position must be its absolute index, as in a full forward)."""
         tr, cfg = self.tr, self.tr.config
         B, C, Fr, h, w = x.shape
         p_t, p_h, p_w = cfg.patch_size
         ppf, pph, ppw = Fr // p_t, h // p_h, w // p_w
         tpf = pph * ppw  # tokens per latent frame
 
-        rotary = tr.rope(x)
+        if frame_offset == 0:
+            rotary = tr.rope(x)
+        else:  # RoPE only reads the shape: build it for offset+F frames and keep the last F
+            n_off = frame_offset // p_t * tpf
+            full = tr.rope(torch.empty((B, C, frame_offset + Fr, h, w), device="meta"))
+            rotary = tuple(f[:, n_off:] for f in full)
         hs = tr.patch_embedding(x) + self.spatial_embed(spatial.to(x.dtype))
         hs = hs.flatten(2).transpose(1, 2).contiguous()
 
@@ -95,9 +114,8 @@ class ActionWorldModel(nn.Module):
         tproj = ce.time_proj(ce.act_fn(temb)).unflatten(2, (6, -1))  # (B,S,6,D)
         enc = ce.text_embedder(text.to(hs.dtype))
 
-        # The mask must stay set after forward: gradient checkpointing re-runs the blocks during
-        # backward. Every forward overwrites it, so it never leaks between calls.
-        self._proc.mask = block_causal_mask(ppf, tpf, x.device) if self.causal else None
+        # The processor builds the block-causal mask from the sequence length (see _MaskedSelfAttn).
+        self._proc.causal, self._proc.tpf = self.causal, tpf
         for blk in tr.blocks:
             if torch.is_grad_enabled() and tr.gradient_checkpointing:
                 hs = tr._gradient_checkpointing_func(blk, hs, enc, tproj, rotary)
@@ -120,15 +138,35 @@ def sample_sigmas(B, F, n_ctx, shift, device, generator=None):
     return sigma.masked_fill(ctx, 0.0), ~ctx
 
 
-def flow_loss(model, x0, spatial, actions, text, n_ctx, shift=3.0, generator=None):
+def flow_loss(model, x0, spatial, actions, text, n_ctx, shift=3.0, generator=None, region=None):
+    """region: optional (B,F,h,w) weights in [0,1]; also returns the loss restricted to it (e.g. hands),
+    so a small but important area isn't drowned out by the whole-frame average."""
     B, C, Fr = x0.shape[:3]
     sigma, loss_mask = sample_sigmas(B, Fr, n_ctx, shift, x0.device, generator)
     eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype, generator=generator)
     s = sigma[:, None, :, None, None].to(x0.dtype)
     xt = (1 - s) * x0 + s * eps
     v = model(xt, sigma, spatial, actions, text)
-    per_frame = F.mse_loss(v.float(), (eps - x0).float(), reduction="none").mean(dim=(1, 3, 4))  # (B,F)
-    return (per_frame * loss_mask).sum() / loss_mask.sum().clamp(min=1), per_frame.detach(), sigma
+    err = F.mse_loss(v.float(), (eps - x0).float(), reduction="none").mean(dim=1)  # (B,F,h,w)
+    per_frame = err.mean(dim=(2, 3))  # (B,F)
+    loss = (per_frame * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+    if region is None:
+        return loss, per_frame.detach(), sigma
+    w = region.float() * loss_mask[:, :, None, None]
+    region_loss = (err * w).sum() / w.sum().clamp(min=1e-6)
+    return loss, per_frame.detach(), sigma, region_loss.detach()
+
+
+def hand_region(spatial, frames_per_latent, dilate=7, thresh=0.05):
+    """(B, S*fpl, F, h, w) conditioning -> (B,F,h,w) mask around the hands: max over all joint and
+    forearm heatmaps of every video frame in the latent group, dilated so it covers the hand's
+    surface, not just the joint centres."""
+    B, C, Fr, h, w = spatial.shape
+    S = C // frames_per_latent
+    sp = spatial.view(B, frames_per_latent, S, Fr, h, w)
+    m = torch.cat([sp[:, :, :42], sp[:, :, 44:46]], 2).amax(dim=(1, 2))  # (B,F,h,w)
+    m = F.max_pool2d(m.flatten(0, 1)[:, None].float(), dilate, 1, dilate // 2)[:, 0].view(B, Fr, h, w)
+    return (m > thresh).float()
 
 
 def tiny_wan(latent_channels: int, text_dim: int = 64) -> WanTransformer3DModel:

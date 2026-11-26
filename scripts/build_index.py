@@ -104,6 +104,9 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--stat-clips", type=int, default=3000)
     ap.add_argument("--clip-frames", type=int, default=33)
+    ap.add_argument("--no-stats", action="store_true",
+                    help="only write index.csv: keep the existing action_stats.npz (a model trained with "
+                         "those normalization stats must keep them, e.g. when fine-tuning on more data)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -117,6 +120,11 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
+
+    if a.no_stats:
+        kept = sum(r["keep"] for r in rows)
+        print(f"index: {len(rows)} episodes, {kept} kept -> {out / 'index.csv'} (action stats untouched)")
+        return
 
     # Action normalization stats from random clips of kept train episodes.
     rng = np.random.default_rng(0)
