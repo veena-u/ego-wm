@@ -74,6 +74,23 @@ setsid nohup bash scripts/remote_job.sh >> /workspace/logs/job.log 2>&1 < /dev/n
   with those normalization stats, and the pipeline checks they are unchanged at the end.
 - Restartable: rerun the same command; finished parts and encoded episodes are skipped.
 
+## Cheaper: encode on 4090s, train elsewhere (R2 work queue)
+Encoding needs no big GPUs: rent a few RTX 4090 machines (>= 1,250 GB disk, >= 12 CPUs per GPU,
+>= 99% reliability, on-demand), each with the code, venv, `data/action_stats.npz` and
+`/root/.config/ego-wm/r2.env`. Then on each:
+```bash
+cp scripts/encoder_autostart.sh /workspace/autostart.sh
+sed -i '/autostart.sh/d; /entrypoint.sh/i bash /workspace/autostart.sh' /root/onstart.sh  # BEFORE entrypoint.sh
+bash /workspace/autostart.sh
+```
+`scripts/encode_worker.sh` pulls work from R2: units are whole parts or shards (`part5.3of8`),
+claimed in `claim/` (refreshed every 10 min; taken over after 2 h without a refresh). A machine keeps
+to a part whose video it already has, else takes the part with the most free shards. Output goes to
+R2 as it is made; `done/<unit>` per unit and `done/<part>` once all its shards are in. When no work is
+left a machine **destroys itself** (`finished/<machine>` in R2 says so); a unit failing 3 times is
+released (`failed/`) and that machine **stops** itself. The training machine runs `scripts/r2_fetch.sh`
+(via `remote_job.sh` with `/workspace/data_from` = `r2`), which waits for every `done/<part>`.
+
 ## Evaluation on all GPUs
 ```bash
 bash scripts/eval_parallel.sh runs/v3/weights/stepN.pt runs/v3/eval_N --clips 32 --cfg 3 --wandb-project ego-wm

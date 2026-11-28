@@ -16,9 +16,14 @@
 #        and are copied too), the part's index goes to index/<part>/, and done/<part> marks it complete.
 #        Several machines can each run different PARTS. SKIP_FINAL=1 skips text embeddings / counts
 #        (the training machine does them after downloading everything).
+#      SHARD=k/K (one part only): encode only every K-th episode starting at k, so several machines can
+#        share a part; markers are then done_<part>.<k>of<K> / done/<part>.<k>of<K> (scripts/encode_worker.sh).
 set -euo pipefail
 DATA=${DATA:-/workspace/data}
 PARTS=(${PARTS:-test part1 part2 part3 part4 part5 extra})
+SHARD=${SHARD:-1/1}; SK=${SHARD%/*}; SN=${SHARD#*/}
+[ "$SN" = 1 ] || [ ${#PARTS[@]} = 1 ] || { echo "SHARD=$SHARD needs exactly one part"; exit 1; }
+unit() { [ "$SN" = 1 ] && echo "$1" || echo "$1.${SK}of${SN}"; }
 NGPU=$(nvidia-smi -L | wc -l)
 PPG=${PROCS_PER_GPU:-2}
 NPROC=$((NGPU * PPG))
@@ -34,10 +39,16 @@ if [ "${R2:-0}" = 1 ]; then
   r2_ok || { echo "R2=1 but no credentials (see scripts/r2.sh)"; exit 1; }
 fi
 r2_sync() {  # $1 local latents dir, $2 min age of files to move (e.g. 2m; 0s at the end)
+  # Never lists the bucket (it grows to ~500k objects; listing it every 2 min from several machines
+  # is slow and gets rate-limited): every file here is new, so upload without checking the destination.
   [ "${R2:-0}" = 1 ] || return 0
-  local dst="r2:$R2_BUCKET/$(basename "$1")"
-  r2 copy "$1" "$dst" --include "*.json" --exclude manifest.json -q || return 1
-  r2 move "$1" "$dst" --include "*.pt" --min-age "$2" -q
+  local dst="r2:$R2_BUCKET/$(basename "$1")" led="$DATA/.r2_uploaded_$(basename "$1")" new
+  r2 move "$1" "$dst" --include "*.pt" --min-age "$2" --no-traverse --no-check-dest -q || return 1
+  # .json sidecars stay here (they mark episodes done for preprocess.py): upload each one once
+  touch "$led"; new="$led.new"
+  find "$1" -maxdepth 1 -name "*.json" ! -name manifest.json -printf "%f\n" | sort | comm -23 - <(sort "$led") > "$new"
+  [ -s "$new" ] || return 0
+  r2 copy "$1" "$dst" --files-from "$new" --no-traverse --no-check-dest -q && cat "$new" >> "$led"
 }
 
 # The model was trained with these normalization stats; fine-tuning must keep them.
@@ -48,19 +59,28 @@ log "CPUs $NCPU, GPUs $NGPU, encoder processes $NPROC ($PPG per GPU, $THREADS CP
 command -v aria2c >/dev/null || { apt-get update -qq && apt-get install -y -qq aria2 unzip >/dev/null; }
 
 for p in "${PARTS[@]}"; do
-  if [ -f "$DATA/done_$p" ]; then log "$p: already done"; continue; fi
+  U=$(unit "$p")
+  if [ -f "$DATA/done_$U" ]; then log "$U: already done"; continue; fi
   [ "$p" = test ] && OUT="$DATA/latents" || OUT="$DATA/latents_full"
   mkdir -p "$OUT"
   # Validation (test) keeps every clip, as in earlier runs; training parts keep MAX_CLIPS per episode.
   [ "$p" = test ] && MAXC=0 || MAXC=${MAX_CLIPS:-2}
 
-  if [ ! -d "$DATA/egodex/$p" ]; then
-    FREE=$(df -BG --output=avail "$DATA" | tail -1 | tr -dc 0-9)
-    [ "$FREE" -ge 700 ] || [ "$p" = test ] || { log "$p: only ${FREE} GB free, need ~700 GB for zip + unzip"; exit 1; }
-    log "$p: downloading"
-    aria2c -q -x 16 -s 16 -c -d "$DATA/egodex" -o "$p.zip" "https://ml-site.cdn-apple.com/datasets/egodex/$p.zip"
+  # Restart-safe: a folder from an interrupted unzip is not a finished part, so completion is a marker.
+  ZIP="$DATA/egodex/$p.zip"; UZ="$DATA/egodex/.unzipped_$p"
+  [ ! -f "$UZ" ] && [ -d "$DATA/egodex/$p" ] && [ ! -e "$ZIP" ] && touch "$UZ"  # finished before markers existed
+  if [ ! -f "$UZ" ]; then
+    if [ ! -f "$ZIP" ] || [ -f "$ZIP.aria2" ]; then  # missing or partial download (aria2c -c resumes)
+      FREE=$(df -BG --output=avail "$DATA" | tail -1 | tr -dc 0-9)
+      [ -f "$ZIP" ] || [ "$FREE" -ge 700 ] || [ "$p" = test ] || { log "$p: only ${FREE} GB free, need ~700 GB for zip + unzip"; exit 1; }
+      log "$p: downloading"
+      aria2c -q -x 16 -s 16 -c -d "$DATA/egodex" -o "$p.zip" "https://ml-site.cdn-apple.com/datasets/egodex/$p.zip" \
+        || { log "$p: download failed"; exit 1; }
+    fi
     log "$p: unzipping"
-    unzip -q "$DATA/egodex/$p.zip" -d "$DATA/egodex" && rm "$DATA/egodex/$p.zip"
+    rm -rf "$DATA/egodex/$p"  # partial unzip from an interrupted run
+    unzip -q "$ZIP" -d "$DATA/egodex" || { log "$p: unzip failed"; exit 1; }
+    touch "$UZ" && rm "$ZIP"
   fi
   [ -d "$DATA/egodex/$p" ] || { log "expected $DATA/egodex/$p after unzip; got:"; ls "$DATA/egodex"; exit 1; }
 
@@ -82,12 +102,13 @@ EOF
     touch "$DATA/index/stats_verified"
   fi
 
-  log "$p: encoding on $NGPU GPUs"
+  log "$U: encoding on $NGPU GPUs"
   pids=()
   for i in $(seq 1 $NPROC); do
     CUDA_VISIBLE_DEVICES=$(( (i - 1) % NGPU )) OMP_NUM_THREADS=$THREADS \
       $PY scripts/preprocess.py --vae wan2.1 --index "$DATA/index/$p/index.csv" --out "$OUT" \
-      --shard "$i/$NPROC" --max-clips "$MAXC" ${LIMIT:+--limit $LIMIT} > "/workspace/logs/prep_${p}_$i.log" 2>&1 &
+      --shard "$(( SK + SN * (i - 1) ))/$(( SN * NPROC ))" --max-clips "$MAXC" ${LIMIT:+--limit $LIMIT} \
+      > "/workspace/logs/prep_${U}_$i.log" 2>&1 &
     pids+=($!)
   done
   if [ "${R2:-0}" = 1 ]; then  # upload finished episodes every 2 min while the encoders run
@@ -97,19 +118,19 @@ EOF
   fail=0; for pid in "${pids[@]}"; do wait "$pid" || fail=1; done
   if [ "${R2:-0}" = 1 ]; then
     kill $UPL 2>/dev/null
-    r2_sync "$OUT" 0s && r2_sync "$OUT" 0s || { log "$p: final upload failed"; exit 1; }
+    r2_sync "$OUT" 0s && r2_sync "$OUT" 0s || { log "$U: final upload failed"; exit 1; }
     left=$(find "$OUT" -name "*.pt" | wc -l)
-    [ "$left" = 0 ] || { log "$p: $left .pt files not uploaded"; exit 1; }
+    [ "$left" = 0 ] || { log "$U: $left .pt files not uploaded"; exit 1; }
     r2 copy "$DATA/index/$p" "r2:$R2_BUCKET/index/$p" -q
   fi
-  [ "$fail" = 0 ] || { log "$p: an encoder process crashed; see /workspace/logs/prep_${p}_*.log"; exit 1; }
-  nfail=$(cat /workspace/logs/prep_${p}_*.log | grep -c "^FAILED" || true)
-  log "$p: encoded. $(grep -h '^done:' /workspace/logs/prep_${p}_*.log | awk '{e+=$2; c+=$4} END {print e" episodes, "c" clips"}'), $nfail failed episodes"
+  [ "$fail" = 0 ] || { log "$U: an encoder process crashed; see /workspace/logs/prep_${U}_*.log"; exit 1; }
+  nfail=$(cat /workspace/logs/prep_${U}_*.log | grep -c "^FAILED" || true)
+  log "$U: encoded. $(grep -h '^done:' /workspace/logs/prep_${U}_*.log | awk '{e+=$2; c+=$4} END {print e" episodes, "c" clips"}'), $nfail failed episodes"
 
   [ "${KEEP_RAW:-0}" = 1 ] || { log "$p: deleting raw video"; rm -rf "$DATA/egodex/$p"; }
-  touch "$DATA/done_$p"
-  [ "${R2:-0}" = 1 ] && { echo "$(date -u) $(hostname)" | r2 rcat "r2:$R2_BUCKET/done/$p"; log "$p: uploaded to R2"; }
-  log "$p: done. Disk: $(df -h --output=used,avail "$DATA" | tail -1)"
+  touch "$DATA/done_$U"
+  [ "${R2:-0}" = 1 ] && { echo "$(date -u) $(hostname)" | r2 rcat "r2:$R2_BUCKET/done/$U"; log "$U: uploaded to R2"; }
+  log "$U: done. Disk: $(df -h --output=used,avail "$DATA" | tail -1)"
 done
 
 [ "$(sha256sum data/action_stats.npz | cut -c1-64)" = "$STATS_SHA" ] || { echo "action_stats.npz changed!"; exit 1; }
